@@ -193,3 +193,68 @@ api POST "/api/v1/windows/$WID/readings/batch" '{
     {"reading_id":"r-50","revision":3,"measured_at":"2026-10-01T00:50:00Z","temperature":20.0}
   ]
 }' | python3 -c "import sys,json;d=json.load(sys.stdin);print('effects:',[x['effect'] for x in d['results']],'reading_count:',d['current_evaluation']['reading_count'])"
+
+echo "== 15. 窗口规则版本化修订（单独建窗口演示）=="
+RW=$(api POST /api/v1/windows '{
+  "name": "展柜C-规则修订",
+  "start_at": "2026-10-01T00:00:00Z",
+  "end_at":   "2026-10-01T00:10:00Z",
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 22.0,
+  "max_continuous_exceed_seconds": 300,
+  "max_sample_interval_seconds": 600
+}')
+RID=$(echo "$RW" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+for mt in 00 05 10; do
+  api POST "/api/v1/windows/$RID/readings" \
+    "{\"reading_id\":\"s-$mt\",\"revision\":1,\"measured_at\":\"2026-10-01T00:$mt:00Z\",\"temperature\":20.0}" >/dev/null
+done
+echo "当前规则修订号（初始规则为第 1 版）：$(echo "$RW" | python3 -c 'import sys,json;print(json.load(sys.stdin)["rule_revision"])')"
+
+echo "-- 15.1 首签（规则第 1 版，结论 pass）--"
+RC1=$(api POST "/api/v1/windows/$RID/certificates/issue" '{"note":"规则第1版"}')
+echo "$RC1" | python3 -c "import sys,json;c=json.load(sys.stdin);print('证书',c['id'],'version',c['version'],c['verdict'],'规则版',c['snapshot']['window']['rule_revision'])"
+
+echo "-- 15.2 提交第 2 版规则（温度上限 22 -> 19.5；20.0 全窗超限 600s > 300 -> fail），立即重算 --"
+api POST "/api/v1/windows/$RID/rule-revisions" '{
+  "revision": 2,
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 19.5,
+  "max_continuous_exceed_seconds": 300,
+  "max_sample_interval_seconds": 600,
+  "reason": "换季：收窄允许温度带"
+}' | python3 -c "import sys,json;d=json.load(sys.stdin);print('effect:',d['effect']);print('before:',d['rule_revision']['before']);print('after:',d['rule_revision']['after']);print('verdict:',d['current_evaluation']['verdict'])"
+
+echo "-- 15.3 同号 + 同四项值 + 同原因重放 -> 幂等（不留新记录）--"
+api POST "/api/v1/windows/$RID/rule-revisions" '{
+  "revision": 2,
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 19.5,
+  "max_continuous_exceed_seconds": 300,
+  "max_sample_interval_seconds": 600,
+  "reason": "换季：收窄允许温度带"
+}' | python3 -c "import sys,json;print('effect:',json.load(sys.stdin)['effect'])"
+
+echo "-- 15.4 拒绝路径：同号原因不同 409 / 旧号 409 / 跳号 409 / 下限大于上限 422 / 非正时长 422 / 空原因 422 / 窗口不存在 404 --"
+api POST "/api/v1/windows/$RID/rule-revisions" '{"revision":2,"allowed_temp_min":18.0,"allowed_temp_max":19.5,"max_continuous_exceed_seconds":300,"max_sample_interval_seconds":600,"reason":"别的原因"}' || true
+api POST "/api/v1/windows/$RID/rule-revisions" '{"revision":1,"allowed_temp_min":18.0,"allowed_temp_max":22.0,"max_continuous_exceed_seconds":300,"max_sample_interval_seconds":600,"reason":"旧号"}' || true
+api POST "/api/v1/windows/$RID/rule-revisions" '{"revision":9,"allowed_temp_min":18.0,"allowed_temp_max":19.5,"max_continuous_exceed_seconds":300,"max_sample_interval_seconds":600,"reason":"跳号"}' || true
+api POST "/api/v1/windows/$RID/rule-revisions" '{"revision":3,"allowed_temp_min":23.0,"allowed_temp_max":22.0,"max_continuous_exceed_seconds":300,"max_sample_interval_seconds":600,"reason":"区间倒置"}' || true
+api POST "/api/v1/windows/$RID/rule-revisions" '{"revision":3,"allowed_temp_min":18.0,"allowed_temp_max":19.5,"max_continuous_exceed_seconds":300,"max_sample_interval_seconds":0,"reason":"非正时长"}' || true
+api POST "/api/v1/windows/$RID/rule-revisions" '{"revision":3,"allowed_temp_min":18.0,"allowed_temp_max":19.5,"max_continuous_exceed_seconds":300,"max_sample_interval_seconds":600,"reason":"   "}' || true
+api POST "/api/v1/windows/999/rule-revisions" '{"revision":2,"allowed_temp_min":18.0,"allowed_temp_max":19.5,"max_continuous_exceed_seconds":300,"max_sample_interval_seconds":600,"reason":"窗口不存在"}' || true
+
+echo "-- 15.5 规则修订历史（第 1 版为初始规则，before 为 null）--"
+api GET "/api/v1/windows/$RID/rule-revisions" | python3 -m json.tool
+
+echo "-- 15.6 旧证书快照仍为第 1 版规则（22.0、pass）；用第 2 版规则再签发 --"
+api GET "/api/v1/certificates/$(echo "$RC1" | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')" \
+  | python3 -c "import sys,json;w=json.load(sys.stdin)['snapshot']['window'];print('旧证规则版:',w['rule_revision'],'上限:',w['allowed_temp_max'])"
+RC2=$(api POST "/api/v1/windows/$RID/certificates/issue" '{"note":"规则第2版"}')
+echo "$RC2" | python3 -c "import sys,json;c=json.load(sys.stdin);print('证书',c['id'],'version',c['version'],c['verdict'],'规则版',c['snapshot']['window']['rule_revision'])"
+
+echo "-- 15.7 跨规则版本修订影响报告：分别依两证快照重建时间线 + 四项规则前后值 --"
+OLD_RC=$(echo "$RC1" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+NEW_RC=$(echo "$RC2" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+api GET "/api/v1/certificates/revision-report?old_certificate_id=$OLD_RC&new_certificate_id=$NEW_RC" \
+  | python3 -c "import sys,json;d=json.load(sys.stdin);print('rules_diff:',d['rules_diff']['rule_revision_before'],'->',d['rules_diff']['rule_revision_after'],d['rules_diff']['changed_fields']);print('timeline_change_count:',d['timeline']['change_count']);print(d['summary']['conclusion_zh'])"

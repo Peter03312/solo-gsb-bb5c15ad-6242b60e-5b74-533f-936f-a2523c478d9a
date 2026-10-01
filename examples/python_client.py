@@ -13,7 +13,11 @@
   5) 采样仪器批量补传：整批事务、逐项 created/updated/idempotent、
      互换采样时刻、整批冲突回滚、重放不产生新修订；
   6) 误采作废与恢复：作废留存修订（原因/时间/前一版本）、幂等重放、
-     拒绝路径、更高修订号恢复（单条与批量）、证书与报告反映移除/再出现。
+     拒绝路径、更高修订号恢复（单条与批量）、证书与报告反映移除/再出现；
+  7) 窗口规则版本化修订：初始规则第 1 版、连续修订号（当前版+1）生效、
+     同号同值同原因幂等/冲突 409、旧号与跳号 409、非法输入 422、
+     立即重算、既有证书快照不变，跨规则版本的修订影响报告分别依两张
+     证书快照重建时间线并给出四项规则前后值。
 """
 from __future__ import annotations
 
@@ -83,6 +87,17 @@ def submit_batch(wid, items):
 def void(wid, rid, rev, reason):
     return call("POST", f"/api/v1/windows/{wid}/readings/{rid}/void",
                 {"revision": rev, "reason": reason})
+
+
+def revise_rules(wid, rev, *, tmin=18.0, tmax=22.0, max_exceed=300.0, max_gap=600.0,
+                 reason="季节切换"):
+    return call("POST", f"/api/v1/windows/{wid}/rule-revisions", {
+        "revision": rev,
+        "allowed_temp_min": tmin, "allowed_temp_max": tmax,
+        "max_continuous_exceed_seconds": max_exceed,
+        "max_sample_interval_seconds": max_gap,
+        "reason": reason,
+    })
 
 
 def item(rid, rev, minute, temp):
@@ -335,6 +350,61 @@ def main() -> None:
     assert code == 409
     ids_now = {x["reading_id"] for x in call("GET", f"/api/v1/windows/{wv}/readings")[1]}
     assert ids_now == {"a", "b", "d"}
+
+    # ---------- 窗口规则版本化修订 ----------
+    show("规则修订：初始规则第 1 版，连续修订号生效；立即重算；快照不变")
+    wr = create_window("展柜F-规则修订", 10, max_exceed=300, max_gap=600)
+    for rid, m in [("a", 0), ("b", 5), ("z", 10)]:
+        assert submit(wr, rid, 1, m, 20.0)[0] == 201
+    assert call("GET", f"/api/v1/windows/{wr}/evaluation")[1]["verdict"] == "pass"
+    cr1 = call("POST", f"/api/v1/windows/{wr}/certificates/issue",
+               {"note": "规则第1版"})[1]
+    print("签发时快照规则修订号:", cr1["snapshot"]["window"]["rule_revision"])
+
+    # 目标号 = 当前版 + 1（即 2）：温度上限收到 19.5，20.0 全部超限
+    code, r = revise_rules(wr, 2, tmax=19.5, reason="换季：收窄允许温度带")
+    print("修订为第 2 版:", code, r["effect"],
+          f"{r['rule_revision']['before']['allowed_temp_max']} -> "
+          f"{r['rule_revision']['after']['allowed_temp_max']}",
+          "->", summary(r["current_evaluation"]))
+    assert code == 201 and r["effect"] == "revised"
+    assert r["current_evaluation"]["verdict"] == "fail"
+
+    # 同号 + 同四项值 + 同原因重放 -> 幂等，不留新记录
+    code, r = revise_rules(wr, 2, tmax=19.5, reason="换季：收窄允许温度带")
+    print("同号同值同原因重放:", code, r["effect"])
+    assert code == 201 and r["effect"] == "idempotent"
+    # 同号但原因不同 / 旧号 / 跳号 -> 409；非法值 / 空原因 -> 422
+    assert revise_rules(wr, 2, tmax=19.5, reason="别的原因")[0] == 409
+    assert revise_rules(wr, 1, reason="旧号")[0] == 409
+    assert revise_rules(wr, 9, tmax=19.5, reason="跳号")[0] == 409
+    assert revise_rules(wr, 3, tmin=23.0, tmax=22.0, reason="区间倒置")[0] == 422
+    assert revise_rules(wr, 3, max_gap=0, reason="非正时长")[0] == 422
+    assert revise_rules(wr, 3, tmax=19.5, reason="   ")[0] == 422
+    print("冲突/旧号/跳号 409，区间倒置/非正时长/空原因 422（均不留新记录）")
+    revs = call("GET", f"/api/v1/windows/{wr}/rule-revisions")[1]
+    print("规则修订历史:", [(x["rule_revision"], x["reason"][:12]) for x in revs])
+    assert [x["rule_revision"] for x in revs] == [1, 2]
+
+    # 窗口起止与读数不变；既有证书快照保持第 1 版规则；新签发采用第 2 版
+    detail = call("GET", f"/api/v1/windows/{wr}")[1]
+    assert detail["rule_revision"] == 2 and len(detail["active_readings"]) == 3
+    old = call("GET", f"/api/v1/certificates/{cr1['id']}")[1]
+    assert old["snapshot"]["window"]["allowed_temp_max"] == 22.0
+    cr2 = call("POST", f"/api/v1/windows/{wr}/certificates/issue",
+               {"note": "规则第2版"})[1]
+    assert cr2["snapshot"]["window"]["rule_revision"] == 2 and cr2["verdict"] == "fail"
+
+    # 跨规则版本的修订影响报告：分别依两证快照重建时间线 + 四项规则前后值
+    rep = call("GET", f"/api/v1/certificates/revision-report"
+                      f"?old_certificate_id={cr1['id']}&new_certificate_id={cr2['id']}")[1]
+    rd = rep["rules_diff"]
+    print("报告规则差异: 第", rd["rule_revision_before"], "版 -> 第",
+          rd["rule_revision_after"], "版, 变化字段 =", rd["changed_fields"])
+    assert rd["changed_fields"] == ["allowed_temp_max"]
+    assert all(c["before"]["status"] == "normal" for c in rep["timeline"]["changes"])
+    assert all(c["after"]["status"] == "exceeded" for c in rep["timeline"]["changes"])
+    print("汇总结论：", rep["summary"]["conclusion_zh"])
 
     print("\n全部示例执行完成 ✔")
 

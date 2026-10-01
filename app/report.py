@@ -40,6 +40,26 @@ _VERDICT_SEVERITY = {"pass": 0, "pending": 1, "fail": 2}
 # 变更字段固定输出顺序
 _FIELD_ORDER = ("revision", "measured_at", "temperature")
 
+# 规则四项固定输出顺序（与 services.RULE_FIELDS 同义，报告内自持常量）
+RULE_FIELD_ORDER = (
+    "allowed_temp_min",
+    "allowed_temp_max",
+    "max_continuous_exceed_seconds",
+    "max_sample_interval_seconds",
+)
+RULE_LABELS_ZH = {
+    "allowed_temp_min": "允许温度下限",
+    "allowed_temp_max": "允许温度上限",
+    "max_continuous_exceed_seconds": "最长连续超限时长",
+    "max_sample_interval_seconds": "最大采样间隔",
+}
+RULE_UNITS_ZH = {
+    "allowed_temp_min": "°C",
+    "allowed_temp_max": "°C",
+    "max_continuous_exceed_seconds": "s",
+    "max_sample_interval_seconds": "s",
+}
+
 
 @dataclass(frozen=True)
 class EvidenceSeg:
@@ -310,6 +330,49 @@ def diff_readings(old_snap: dict[str, Any],
     }
 
 
+# ------------------------------------------------------------ 规则差异
+
+def _snapshot_rule_revision(snap: dict[str, Any]) -> int:
+    """快照所属规则修订号；规则版本化之前签发的旧快照按第 1 版处理。"""
+    return int(snap.get("window", {}).get("rule_revision", 1))
+
+
+def diff_rules(old_snap: dict[str, Any], new_snap: dict[str, Any]) -> dict[str, Any]:
+    """比较两版快照的窗口规则：各自规则修订号 + 四项规则前后值与变化。
+
+    时间线（align_timelines）已分别依据两张快照的规则参数重建，因此即使
+    审定结论未变，这里仍明确给出四项规则的前后值与 changed_fields，使
+    跨规则版本的修订影响可以直接看出规则变更。
+    """
+    ow, nw = _snapshot_window(old_snap), _snapshot_window(new_snap)
+    old_rev, new_rev = _snapshot_rule_revision(old_snap), _snapshot_rule_revision(new_snap)
+
+    changes = []
+    changed_fields = []
+    for f in RULE_FIELD_ORDER:
+        old_v, new_v = float(ow[f]), float(nw[f])
+        if old_v != new_v:
+            changed_fields.append(f)
+            changes.append({
+                "field": f,
+                "label_zh": RULE_LABELS_ZH[f],
+                "before": old_v,
+                "after": new_v,
+                "delta": round(new_v - old_v, 3),
+                "unit_zh": RULE_UNITS_ZH[f],
+            })
+
+    return {
+        "rule_revision_before": old_rev,
+        "rule_revision_after": new_rev,
+        "rules_changed": bool(changed_fields),
+        "changed_fields": changed_fields,
+        "before": {"rule_revision": old_rev, **{f: float(ow[f]) for f in RULE_FIELD_ORDER}},
+        "after": {"rule_revision": new_rev, **{f: float(nw[f]) for f in RULE_FIELD_ORDER}},
+        "changes": changes,
+    }
+
+
 # ------------------------------------------------------------ 汇总结论
 
 def _verdict_direction(old_v: str, new_v: str) -> str:
@@ -324,7 +387,8 @@ def _verdict_direction(old_v: str, new_v: str) -> str:
 
 def _build_summary(old_cert: dict[str, Any], new_cert: dict[str, Any],
                    reading_diff: dict[str, Any],
-                   changes: Sequence[dict[str, Any]]) -> dict[str, Any]:
+                   changes: Sequence[dict[str, Any]],
+                   rule_diff: dict[str, Any]) -> dict[str, Any]:
     old_ev = old_cert["snapshot"]["evaluation"]
     new_ev = new_cert["snapshot"]["evaluation"]
     old_v, new_v = old_cert["verdict"], new_cert["verdict"]
@@ -344,10 +408,30 @@ def _build_summary(old_cert: dict[str, Any], new_cert: dict[str, Any],
         f"审定结论：{VERDICT_LABELS_ZH.get(old_v, old_v)}（{old_v}）→ "
         f"{VERDICT_LABELS_ZH.get(new_v, new_v)}（{new_v}），{direction}。",
         f"最长连续超限时长：{old_max:g}s → {new_max:g}s（{delta_text}；限值 {limit:g}s）。",
+    ]
+    if rule_diff["rules_changed"]:
+        parts = []
+        for ch in rule_diff["changes"]:
+            d = ch["delta"]
+            d_text = f"{'增加' if d > 0 else '减少'} {abs(d):g}{ch['unit_zh']}"
+            parts.append(
+                f"{ch['label_zh']} {ch['before']:g} → {ch['after']:g}{ch['unit_zh']}"
+                f"（{d_text}）"
+            )
+        lines.append(
+            f"规则由第 {rule_diff['rule_revision_before']} 版修订为第 "
+            f"{rule_diff['rule_revision_after']} 版：{'；'.join(parts)}。"
+        )
+    else:
+        lines.append(
+            f"规则版本：第 {rule_diff['rule_revision_before']} 版 → 第 "
+            f"{rule_diff['rule_revision_after']} 版，四项规则值无变化。"
+        )
+    lines.append(
         f"读数差异：新增 {reading_diff['added_count']} 条、"
         f"变更 {reading_diff['changed_count']} 条、"
-        f"移除 {reading_diff['removed_count']} 条（均以两张证书的不可变快照为据）。",
-    ]
+        f"移除 {reading_diff['removed_count']} 条（均以两张证书的不可变快照为据）。"
+    )
     if changes:
         lines.append(f"时间线共有 {len(changes)} 个半开区间状态发生变化（相邻同证据区间已合并）。")
     else:
@@ -378,9 +462,10 @@ def build_revision_report(old_cert: dict[str, Any],
     调用方负责保证两证存在、属于同一审定窗口且版本严格按先后排列。
     """
     old_snap, new_snap = old_cert["snapshot"], new_cert["snapshot"]
+    rule_diff = diff_rules(old_snap, new_snap)
     reading_diff = diff_readings(old_snap, new_snap)
     changes = align_timelines(old_snap, new_snap)
-    summary = _build_summary(old_cert, new_cert, reading_diff, changes)
+    summary = _build_summary(old_cert, new_cert, reading_diff, changes, rule_diff)
 
     win = dict(new_snap["window"])
 
@@ -399,6 +484,7 @@ def build_revision_report(old_cert: dict[str, Any],
         "window": win,
         "old_certificate": cert_ref(old_cert),
         "new_certificate": cert_ref(new_cert),
+        "rules_diff": rule_diff,
         "readings_diff": reading_diff,
         "timeline": {
             "max_sample_interval_seconds": float(win["max_sample_interval_seconds"]),

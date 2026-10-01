@@ -67,6 +67,29 @@ CREATE TABLE IF NOT EXISTS reading_revisions (
     UNIQUE(window_id, reading_id, revision)
 );
 
+-- 审定窗口规则版本化：窗口初始规则视为第 1 版（由建窗事务写入）。
+-- 每次规则修订新增一行（窗口号 + 规则修订号唯一），留存修订前后四项规则值、
+-- 原因与操作时间；windows 表始终保存当前版本规则，重算/签发均以其为准。
+CREATE TABLE IF NOT EXISTS rule_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER NOT NULL REFERENCES windows(id),
+    rule_revision INTEGER NOT NULL,            -- 从 1 起；必须连续递增（当前号 +1）
+    allowed_temp_min_before REAL,              -- 第 1 版无前值（NULL）；其余为修订前值
+    allowed_temp_max_before REAL,
+    max_continuous_exceed_seconds_before REAL,
+    max_sample_interval_seconds_before REAL,
+    allowed_temp_min_after REAL NOT NULL,
+    allowed_temp_max_after REAL NOT NULL,
+    max_continuous_exceed_seconds_after REAL NOT NULL,
+    max_sample_interval_seconds_after REAL NOT NULL,
+    reason TEXT NOT NULL,
+    revised_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(window_id, rule_revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rule_revisions_window
+    ON rule_revisions(window_id, rule_revision);
+
 -- 证书版本：同一窗口每次签发新增一行，快照不可变
 CREATE TABLE IF NOT EXISTS certificates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,13 +133,53 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """幂等建表；对已存在的旧库补齐作废相关列。"""
+    """幂等建表；对已存在的旧库补齐作废相关列。
+
+    规则版本化上线前创建的窗口在 rule_revisions 中没有历史，这里按其当前
+    规则补一条第 1 版（初始规则即第 1 版），使后续修订可从第 2 版连续提交。
+    """
     conn.executescript(SCHEMA_SQL)
     for table, column, ddl in _COLUMN_MIGRATIONS:
         cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         if column not in cols:
             conn.execute(ddl)
+    _backfill_initial_rule_revisions(conn)
     conn.commit()
+
+
+def _backfill_initial_rule_revisions(conn: sqlite3.Connection) -> None:
+    """为没有任何规则修订记录的既有窗口补写第 1 版（初始规则）。
+
+    原因标记为系统迁移；before 四值为 NULL（首版无前值）；新窗口在建窗
+    事务内自行写入第 1 版，不会被本逻辑重复插入。
+    """
+    rows = conn.execute(
+        """
+        SELECT w.* FROM windows w
+        WHERE NOT EXISTS (
+            SELECT 1 FROM rule_revisions r WHERE r.window_id = w.id
+        )
+        """
+    ).fetchall()
+    conn.executemany(
+        """
+        INSERT INTO rule_revisions (
+            window_id, rule_revision,
+            allowed_temp_min_before, allowed_temp_max_before,
+            max_continuous_exceed_seconds_before, max_sample_interval_seconds_before,
+            allowed_temp_min_after, allowed_temp_max_after,
+            max_continuous_exceed_seconds_after, max_sample_interval_seconds_after,
+            reason, revised_at)
+        VALUES (?, 1, NULL, NULL, NULL, NULL, ?, ?, ?, ?,
+                '系统迁移：窗口初始规则记为第 1 版', ?)
+        """,
+        [
+            (r["id"], r["allowed_temp_min"], r["allowed_temp_max"],
+             r["max_continuous_exceed_seconds"], r["max_sample_interval_seconds"],
+             r["created_at"])
+            for r in rows
+        ],
+    )
 
 
 @contextmanager

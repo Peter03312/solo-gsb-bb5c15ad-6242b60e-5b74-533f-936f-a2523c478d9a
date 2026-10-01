@@ -5,9 +5,11 @@
 区段，计算**最长连续超限时长**，并给出审定结论；支持读数幂等提交、修订替换、
 **采样仪器按审定窗口批量补传（整批事务、互换时刻、重放不产生新修订）**、
 **误采作废与恢复（作废留存修订：原因/操作时间/前一版本；更高修订号恢复）**、
-证书版本化签发（快照不可变），并可对同一审定窗口的两张已签发证书生成
-**修订影响报告**（只读快照比对：读数新增/变更/移除、时间线状态变化半开区间、
-结论与最长连续超限时长变化）。
+证书版本化签发（快照不可变），支持馆员对窗口四项审定规则做
+**版本化修订**（初始规则为第 1 版，连续修订号 + 非空原因，立即重算、
+既有证书快照不变），并可对同一审定窗口的两张已签发证书生成
+**修订影响报告**（只读快照比对：规则四项前后值、读数新增/变更/移除、
+时间线状态变化半开区间、结论与最长连续超限时长变化）。
 
 - 技术栈：Python 3.11 · FastAPI · SQLite（WAL 模式）· Pydantic v2
 - 无外部服务依赖，`docker compose up -d` 一键启动并自动初始化数据库
@@ -105,6 +107,47 @@
 - 作废/恢复与证书：已签发证书快照保持原样；作废或恢复后再次签发形成
   新版本，修订影响报告将该读数呈现为**移除（removed）**或**再出现（added）**。
 
+### 窗口规则版本化修订
+
+馆员可修订审定窗口的四项规则（允许温度下/上限、最长连续超限时长、
+最大采样间隔）。**窗口的初始规则视为第 1 版**（建窗时自动留痕，
+`before` 为 `null`，原因记为“窗口初始规则（第 1 版）”），通过
+`POST /api/v1/windows/{id}/rule-revisions` 提交**窗口标识、目标规则修订号、
+四项完整新值与非空原因**：
+
+```json
+{
+  "revision": 2,
+  "allowed_temp_min": 18.0,
+  "allowed_temp_max": 19.5,
+  "max_continuous_exceed_seconds": 300,
+  "max_sample_interval_seconds": 600,
+  "reason": "换季：收窄允许温度带"
+}
+```
+
+- **生效**：`revision` 必须等于“当前版 + 1”（必须连续、不得跳号）。
+  成功后窗口当前规则立即更新，**窗口起止时间与读数保持不变**，并在同一
+  事务内**按当前活动读数立即重算**（响应含 `current_evaluation`）；
+  修订留存**前/后四项规则值、原因与操作时间**（`revised_at`），
+  `GET /api/v1/windows/{id}/rule-revisions` 可查全部规则版本（升序）。
+- **幂等重放**：`revision` 等于当前版，且**四项规则值与原因均一致** →
+  幂等返回（`effect: idempotent`），不留新记录。
+- **拒绝（均不留新记录）**：
+  - 同号但四项值任一不一致、或原因不一致 → **409 同号冲突**；
+  - `revision` 小于当前版（旧号）→ **409**；
+  - `revision` 大于“当前版 + 1”（跳号）→ **409**；
+  - 数值非有限（`NaN`/`Infinity`）、温度下限大于上限、
+    两个时长 ≤ 0、原因为空或只含空白 → **422**；
+  - 窗口不存在 → **404**。
+- **与签发/证书的关系**：修订前已签发证书的**快照原样保留**（快照内
+  `window` 带 `rule_revision`，旧快照按第 1 版解读）；**后续签发采用
+  新规则**形成新版本。窗口详情与列表新增 `rule_revision` 字段
+  （当前规则修订号；既有窗口、读数、证书接口字段含义不变，仅新增字段
+  与新端点）。
+- 规则版本化上线前创建的旧库窗口，服务启动时自动按其当前规则**回填
+  第 1 版**，可直接提交第 2 版；重复启动不会重复回填。
+
 ### 签发与并发
 
 - 签发把**当前已提交状态**（窗口参数 + 全部活动读数 + 审定结果）固化为不可变快照，
@@ -171,10 +214,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/api/v1/windows` | 创建审定窗口（窗口倒置/温度区间倒置返回 422） |
+| `POST` | `/api/v1/windows` | 创建审定窗口（窗口倒置/温度区间倒置返回 422）；初始规则自动记为第 1 版 |
 | `GET` | `/api/v1/windows?limit=&offset=` | 窗口列表（分页） |
-| `GET` | `/api/v1/windows/{id}` | 窗口详情：活动读数 + 当前审定 + 最新证书 |
+| `GET` | `/api/v1/windows/{id}` | 窗口详情：当前规则修订号 + 活动读数 + 当前审定 + 最新证书 |
 | `GET` | `/api/v1/windows/{id}/evaluation` | 只看当前审定结果 |
+| `POST` | `/api/v1/windows/{id}/rule-revisions` | 规则版本化修订：目标修订号（当前版+1 生效）+ 四项完整新值 + 非空原因，响应含立即重算结果；同号同值同原因重放幂等 |
+| `GET` | `/api/v1/windows/{id}/rule-revisions` | 该窗口全部规则修订历史（第 1 版为初始规则，升序） |
 
 创建窗口请求体：
 
@@ -268,13 +313,22 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/api/v1/certificates/revision-report?old_certificate_id=&new_certificate_id=` | 对同一窗口两张已签发证书生成修订影响报告 |
 
 证书含 `id`、`window_id`、`version`、`verdict`、`verdict_label_zh`
-（合格/待定/不合格）、`issued_at`、`note`、`snapshot`。
+（合格/待定/不合格）、`issued_at`、`note`、`snapshot`。`snapshot.window`
+带签发时的规则修订号 `rule_revision`（规则版本化之前的旧证书按第 1 版解读）。
 
 ### 修订影响报告
 
 输入**同一审定窗口**的两张**已签发**证书主键（旧版在前、新版在后），服务只读取
 两证各自的**不可变快照**，不读取当前活动读数，输出：
 
+- `rules_diff`：两证快照各自的规则修订号（`rule_revision_before/after`，
+  规则版本化之前签发的旧快照按第 1 版计）与**四项规则的前后值**——
+  `before`/`after` 各含规则修订号与四项规则值，`changed_fields` 为
+  `allowed_temp_min` / `allowed_temp_max` /
+  `max_continuous_exceed_seconds` / `max_sample_interval_seconds` 的子集，
+  `changes` 逐项给出中文名、前后值、增量 `delta` 与单位（°C / s），
+  `rules_changed` 标识是否有规则值变化。**即使审定结论未变，跨规则版本
+  的规则前后值也在此明确可见。**
 - `readings_diff`：按 `reading_id` 对齐两版快照读数。
   - `added`：新版新增读数（含 `revision`/`measured_at`/`temperature`）；
   - `changed`：两版都存在但读数有变化的项，含 `before`/`after` 全量值与
@@ -282,8 +336,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
     采样时间按时刻比较，时区表示不同不视为变化）；
   - `removed`：新版消失的读数（两证签发之间该读数被误采作废；恢复后再次
     签发则体现为 `added`）；
-- `timeline.changes`：用两版快照参数与读数各自重建半开覆盖区段
-  （与第 1 节同一条采样保持/间隔超限/边界空白规则），取两版**全部区段边界
+- `timeline.changes`：**分别用两版快照各自的窗口参数与读数**重建半开覆盖
+  区段（与第 1 节同一条采样保持/间隔超限/边界空白规则；跨规则版本时
+  两证各按各的温度区间与时长限值判定），取两版**全部区段边界
   的并集**切分后，只保留**状态发生变化**的半开区间，每个区间给出：
   - `start`/`end`/`duration_seconds`（半开 `[start, end)`）；
   - `before`/`after`：变化前后 `status`（`normal`/`exceeded`/`unknown`）
@@ -299,7 +354,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - `summary`：审定结论变化（`verdict_before/after`、中文标签、
   `verdict_direction` 改善/恶化/持平）、最长连续超限时长前后值与增量
   `max_continuous_exceeded_seconds_delta`、时间线变化区间数，以及一段
-  中文汇总结论 `conclusion_zh`。
+  中文汇总结论 `conclusion_zh`（其中单独一行说明**规则版本与四项规则
+  前后值变化**；规则值无变化时也会注明两证规则版本与“四项规则值无变化”）。
 
 > 时间线只输出**状态**变化；若未知原因由“边界空白”变为“采样间隔超限”
 > （或反之）但两侧都仍为 `unknown`，该区间状态未变、不进入 `timeline.changes`，
@@ -312,14 +368,27 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - 两 ID 相同、两证不属于同一窗口、或旧版 `version` 不严格小于新版
   （版本未按先后排列）→ `422`，响应 `detail` 说明具体原因；
 - 报告是只读 GET，不改变任何既有内容；既有证书结构、查询响应与审定规则
-  保持不变（仅新增端点与响应模型）。
+  保持不变（仅新增端点与响应模型；报告新增 `rules_diff` 字段，
+  `summary.conclusion_zh` 增加一行规则版本说明，证书快照 `window`
+  新增 `rule_revision`，窗口响应新增 `rule_revision`，均为增量字段）。
 
 报告响应示例（fail → pass 整改）：
 
 ```json
 {
+  "window": {"id": 1, "rule_revision": 2, "...": "..."},
   "old_certificate": {"id": 1, "window_id": 1, "version": 1, "verdict": "fail", "...": "..."},
   "new_certificate": {"id": 2, "window_id": 1, "version": 2, "verdict": "pass", "...": "..."},
+  "rules_diff": {
+    "rule_revision_before": 1, "rule_revision_after": 2,
+    "rules_changed": true, "changed_fields": ["allowed_temp_max"],
+    "before": {"rule_revision": 1, "allowed_temp_min": 18.0, "allowed_temp_max": 22.0,
+               "max_continuous_exceed_seconds": 300.0, "max_sample_interval_seconds": 600.0},
+    "after":  {"rule_revision": 2, "allowed_temp_min": 18.0, "allowed_temp_max": 19.5,
+               "max_continuous_exceed_seconds": 300.0, "max_sample_interval_seconds": 600.0},
+    "changes": [{"field": "allowed_temp_max", "label_zh": "允许温度上限",
+                 "before": 22.0, "after": 19.5, "delta": -2.5, "unit_zh": "°C"}]
+  },
   "readings_diff": {
     "added": [], "removed": [],
     "changed": [{
@@ -359,10 +428,12 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
   作废或查询修订历史时读数从未存在
 - `409`：同 ID+修订号内容冲突；旧修订号覆盖（单条与批量语义一致）；
   作废修订号原因冲突或不高于当前修订号；已作废读数再次以新修订号作废；
-  以不高于作废修订号的提交尝试复活读数
+  以不高于作废修订号的提交尝试复活读数；
+  规则修订同号但四项值/原因不一致、旧号提交、跳号提交
 - `422`：无效窗口、窗口外读数、同刻不同读数（批量按最终状态判定）、
   批量请求为空批次/同批 `reading_id` 重复、缺时区/字段非法、
   作废原因为空或只含空白等；
+  规则修订数值非有限、温度下限大于上限、时长非正、原因为空或只含空白；
   修订影响报告的两证书相同、跨审定窗口、版本未按先后排列也返回 422
 
 > 批量补传中任一项命中 409/422，整批回滚，错误 `detail` 指出具体原因；
@@ -375,10 +446,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 服务启动后：
 
 ```bash
-# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复）
+# curl 全流程（创建窗口 → 提交/幂等/冲突/修订 → 审定 → 两次签发 → 修订影响报告 → 批量补传 → 误采作废与恢复 → 规则版本化修订与跨规则版本报告）
 bash examples/curl-examples.sh
 
-# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复）
+# Python 全流程（仅标准库，演示三种结论、拒收、修订、版本快照、修订影响报告、批量补传、误采作废与恢复、规则版本化修订与跨规则版本报告）
 python3 examples/python_client.py
 # 或指定地址：
 BASE_URL=http://127.0.0.1:8000 python3 examples/python_client.py
@@ -445,6 +516,25 @@ curl -sS -X POST http://localhost:8000/api/v1/windows/1/certificates/issue \
   -H 'Content-Type: application/json' -d '{"note":"作废/恢复后重签"}'
 ```
 
+规则版本化修订最小示例（承接窗口 1；初始规则为第 1 版）：
+
+```bash
+# 第 2 版规则（当前版 1 + 1 才生效）：四项完整新值 + 非空原因；立即重算
+curl -sS http://localhost:8000/api/v1/windows/1/rule-revisions \
+  -H 'Content-Type: application/json' -d '{
+    "revision": 2,
+    "allowed_temp_min": 18.0, "allowed_temp_max": 19.5,
+    "max_continuous_exceed_seconds": 300,
+    "max_sample_interval_seconds": 600,
+    "reason": "换季：收窄允许温度带"}'
+# 原样重放（同号 + 同四项值 + 同原因）-> effect=idempotent，不留新记录；
+# 同号值/原因不同、旧号、跳号 -> 409；
+# 下限>上限、时长<=0、NaN/Infinity、空原因 -> 422；窗口不存在 -> 404
+
+# 查阅全部规则版本（第 1 版为初始规则，before 为 null）
+curl -sS http://localhost:8000/api/v1/windows/1/rule-revisions
+```
+
 ---
 
 ## 5. 测试
@@ -470,18 +560,24 @@ PYTHONPATH=. python -m pytest tests/ -q
   批量冲突整批回滚、证书快照不变与报告呈现 removed/added）。
 - `tests/test_report_api.py`：修订影响报告 HTTP 测试（fail→pass、
   边界空白 vs 采样间隔超限、只依快照、跨窗口/倒序/同 ID/不存在拒绝）。
+- `tests/test_rule_revision_api.py`：窗口规则版本化修订 HTTP 测试
+  （初始第 1 版、连续修订号生效并立即重算、同号同值同原因幂等、
+  同号值/原因冲突、旧号与跳号拒绝、非有限/区间倒置/非正时长/空原因 422、
+  窗口 404、窗口起止与读数不变、旧证快照不变与后续签发采用新规则、
+  跨规则版本报告分别依两证快照重建时间线并给出四项规则前后值、
+  即使结论不变规则变化仍可见、旧库第 1 版回填幂等）。
 
 ## 6. 目录结构
 
 ```
 app/
   config.py        # 环境变量配置
-  database.py      # SQLite 连接、WAL、建表（含旧库补列迁移）、写事务（BEGIN IMMEDIATE）
+  database.py      # SQLite 连接、WAL、建表（含旧库补列迁移/规则第 1 版回填）、写事务（BEGIN IMMEDIATE）
   evaluation.py    # 核心审定算法（纯函数）
-  report.py        # 修订影响报告（快照比对、时间线对齐，纯函数）
+  report.py        # 修订影响报告（规则前后值、快照比对、时间线对齐，纯函数）
   models.py        # 结论枚举/常量
-  schemas.py       # Pydantic 请求/响应模型
-  services.py      # 窗口、读数（含误采作废/恢复）、审定、签发、修订影响报告业务逻辑
+  schemas.py       # Pydantic 请求/响应模型（含规则修订）
+  services.py      # 窗口、窗口规则版本化修订、读数（含误采作废/恢复）、审定、签发、修订影响报告业务逻辑
   main.py          # FastAPI 路由
 examples/
   curl-examples.sh

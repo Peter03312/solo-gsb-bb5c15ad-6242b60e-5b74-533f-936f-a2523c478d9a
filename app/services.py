@@ -10,8 +10,35 @@ from fastapi import HTTPException, status
 from .evaluation import evaluate
 from .models import READING_VOIDED, VERDICT_LABELS_ZH
 from .report import build_revision_report
-from .schemas import ReadingBatchSubmit, ReadingSubmit, ReadingVoidSubmit, WindowCreate
+from .schemas import (
+    ReadingBatchSubmit,
+    ReadingSubmit,
+    ReadingVoidSubmit,
+    RuleRevisionSubmit,
+    WindowCreate,
+)
 from .timeutils import parse_stored, to_iso, to_utc
+
+# 规则四项值（固定键顺序），供规则修订、版本化与报告复用
+RULE_FIELDS = (
+    "allowed_temp_min",
+    "allowed_temp_max",
+    "max_continuous_exceed_seconds",
+    "max_sample_interval_seconds",
+)
+RULE_LABELS_ZH = {
+    "allowed_temp_min": "允许温度下限",
+    "allowed_temp_max": "允许温度上限",
+    "max_continuous_exceed_seconds": "最长连续超限时长",
+    "max_sample_interval_seconds": "最大采样间隔",
+}
+RULE_UNITS_ZH = {
+    "allowed_temp_min": "°C",
+    "allowed_temp_max": "°C",
+    "max_continuous_exceed_seconds": "s",
+    "max_sample_interval_seconds": "s",
+}
+INITIAL_RULE_REASON = "窗口初始规则（第 1 版）"
 
 
 # ---------------------------------------------------------------- 窗口
@@ -48,6 +75,8 @@ def create_window(conn: sqlite3.Connection, payload: WindowCreate) -> dict[str, 
         ),
     )
     row = conn.execute("SELECT * FROM windows WHERE id = ?", (cur.lastrowid,)).fetchone()
+    # 窗口初始规则视为第 1 版：与建窗同一事务留痕（before 四值为 NULL）
+    _insert_initial_rule_revision(conn, row)
     return window_to_dict(conn, row)
 
 
@@ -650,6 +679,11 @@ def window_to_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]
         "SELECT version, verdict FROM certificates WHERE window_id=? ORDER BY version DESC LIMIT 1",
         (row["id"],),
     ).fetchone()
+    rule_row = conn.execute(
+        "SELECT rule_revision FROM rule_revisions WHERE window_id=? "
+        "ORDER BY rule_revision DESC LIMIT 1",
+        (row["id"],),
+    ).fetchone()
     return {
         "id": row["id"],
         "name": row["name"],
@@ -659,6 +693,7 @@ def window_to_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]
         "allowed_temp_max": row["allowed_temp_max"],
         "max_continuous_exceed_seconds": row["max_continuous_exceed_seconds"],
         "max_sample_interval_seconds": row["max_sample_interval_seconds"],
+        "rule_revision": rule_row["rule_revision"] if rule_row else 1,
         "created_at": row["created_at"],
         "latest_certificate_version": latest["version"] if latest else None,
         "latest_verdict": latest["verdict"] if latest else None,
@@ -670,6 +705,218 @@ def window_detail(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
     data["active_readings"] = [reading_to_dict(r) for r in list_active_readings(conn, row["id"])]
     data["current_evaluation"] = compute_evaluation(conn, row)
     return data
+
+
+# ---------------------------------------------------------------- 规则修订
+
+def _rule_values_from_window(row: sqlite3.Row) -> dict[str, float]:
+    return {f: float(row[f]) for f in RULE_FIELDS}
+
+
+def _rule_values_from_payload(payload: RuleRevisionSubmit) -> dict[str, float]:
+    return {
+        "allowed_temp_min": float(payload.allowed_temp_min),
+        "allowed_temp_max": float(payload.allowed_temp_max),
+        "max_continuous_exceed_seconds": float(payload.max_continuous_exceed_seconds),
+        "max_sample_interval_seconds": float(payload.max_sample_interval_seconds),
+    }
+
+
+def _insert_initial_rule_revision(conn: sqlite3.Connection, win: sqlite3.Row) -> None:
+    """窗口初始规则作为第 1 版留痕（建窗事务内调用；before 四值为 NULL）。"""
+    values = _rule_values_from_window(win)
+    conn.execute(
+        """
+        INSERT INTO rule_revisions (
+            window_id, rule_revision,
+            allowed_temp_min_before, allowed_temp_max_before,
+            max_continuous_exceed_seconds_before, max_sample_interval_seconds_before,
+            allowed_temp_min_after, allowed_temp_max_after,
+            max_continuous_exceed_seconds_after, max_sample_interval_seconds_after,
+            reason, revised_at)
+        VALUES (?, 1, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)
+        """,
+        (win["id"], values["allowed_temp_min"], values["allowed_temp_max"],
+         values["max_continuous_exceed_seconds"], values["max_sample_interval_seconds"],
+         INITIAL_RULE_REASON, win["created_at"]),
+    )
+
+
+def _latest_rule_revision_row(
+    conn: sqlite3.Connection, window_id: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM rule_revisions WHERE window_id=? "
+        "ORDER BY rule_revision DESC LIMIT 1",
+        (window_id,),
+    ).fetchone()
+
+
+def _current_rule_revision_number(conn: sqlite3.Connection, window_id: int) -> int:
+    """当前规则修订号。正常不变式下来自 rule_revisions；旧库/防御场景缺记录时
+
+    视为第 1 版（当前 windows 行即初始规则）。
+    """
+    row = _latest_rule_revision_row(conn, window_id)
+    return int(row["rule_revision"]) if row is not None else 1
+
+
+def rule_revision_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    before = None
+    if row["allowed_temp_min_before"] is not None:
+        before = {
+            "allowed_temp_min": row["allowed_temp_min_before"],
+            "allowed_temp_max": row["allowed_temp_max_before"],
+            "max_continuous_exceed_seconds":
+                row["max_continuous_exceed_seconds_before"],
+            "max_sample_interval_seconds":
+                row["max_sample_interval_seconds_before"],
+        }
+    return {
+        "rule_revision": row["rule_revision"],
+        "before": before,
+        "after": {
+            "allowed_temp_min": row["allowed_temp_min_after"],
+            "allowed_temp_max": row["allowed_temp_max_after"],
+            "max_continuous_exceed_seconds":
+                row["max_continuous_exceed_seconds_after"],
+            "max_sample_interval_seconds":
+                row["max_sample_interval_seconds_after"],
+        },
+        "reason": row["reason"],
+        "revised_at": row["revised_at"],
+    }
+
+
+def revise_window_rules(
+    conn: sqlite3.Connection, window_id: int, payload: RuleRevisionSubmit
+) -> tuple[str, dict[str, Any]]:
+    """修订窗口规则，返回 (effect, rule_revision_dict)。调用方需已持有写事务。
+
+    窗口初始规则视为第 1 版：目标号 = 当前版 + 1 生效；目标号 = 当前版且
+    四项值与原因均一致为重放幂等；同号冲突、旧号、跳号一律 409 拒绝且不留
+    新记录。生效时更新 windows 当前规则并新增一条修订留痕，审定重算由调用方
+    在同一事务内基于更新后的窗口行完成。
+    """
+    new_values = _rule_values_from_payload(payload)
+    # 窗口不存在 -> 404（先于一切校验）
+    win_row = get_window_row(conn, window_id)
+    # 跨字段校验（Pydantic 单字段校验之外）：下限不大于上限
+    if new_values["allowed_temp_min"] > new_values["allowed_temp_max"]:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "无效规则：allowed_temp_max 不能小于 allowed_temp_min（"
+                f"下限 {new_values['allowed_temp_min']}，"
+                f"上限 {new_values['allowed_temp_max']}）"
+            ),
+        )
+
+    current = _latest_rule_revision_row(conn, window_id)
+    if current is None:
+        # 旧库防御：无任何规则版本记录时把当前 windows 行视作第 1 版
+        current_no = 1
+        current_values = _rule_values_from_window(win_row)
+        current_reason = INITIAL_RULE_REASON
+    else:
+        current_no = int(current["rule_revision"])
+        current_values = {
+            "allowed_temp_min": float(current["allowed_temp_min_after"]),
+            "allowed_temp_max": float(current["allowed_temp_max_after"]),
+            "max_continuous_exceed_seconds":
+                float(current["max_continuous_exceed_seconds_after"]),
+            "max_sample_interval_seconds":
+                float(current["max_sample_interval_seconds_after"]),
+        }
+        current_reason = current["reason"]
+
+    if payload.revision == current_no:
+        # 同号：四项值与原因均一致 -> 幂等重放，不留新记录；否则冲突
+        if current_values == new_values and current_reason == payload.reason:
+            return "idempotent", rule_revision_to_dict(current)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"规则修订号 {payload.revision} 已存在但内容冲突："
+                f"已存（{current_values}，原因「{current_reason}」），"
+                f"本次（{new_values}，原因「{payload.reason}」）。"
+                "相同规则修订号重放必须四项规则值与原因完全一致。"
+            ),
+        )
+
+    if payload.revision < current_no:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"窗口 {window_id} 当前规则修订号为 {current_no}，"
+                f"拒绝修订号 {payload.revision}：旧修订号不能覆盖更高修订号。"
+            ),
+        )
+
+    if payload.revision != current_no + 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"拒绝规则修订号 {payload.revision}：当前为第 {current_no} 版，"
+                f"只接受第 {current_no + 1} 版（规则修订号必须连续递增，不得跳号）。"
+            ),
+        )
+
+    # 生效：windows 当前规则立即更新（起止时间与读数不变），并新增一条留痕
+    conn.execute(
+        """
+        UPDATE windows SET
+            allowed_temp_min=?, allowed_temp_max=?,
+            max_continuous_exceed_seconds=?, max_sample_interval_seconds=?
+        WHERE id=?
+        """,
+        (new_values["allowed_temp_min"], new_values["allowed_temp_max"],
+         new_values["max_continuous_exceed_seconds"],
+         new_values["max_sample_interval_seconds"], window_id),
+    )
+    conn.execute(
+        """
+        INSERT INTO rule_revisions (
+            window_id, rule_revision,
+            allowed_temp_min_before, allowed_temp_max_before,
+            max_continuous_exceed_seconds_before, max_sample_interval_seconds_before,
+            allowed_temp_min_after, allowed_temp_max_after,
+            max_continuous_exceed_seconds_after, max_sample_interval_seconds_after,
+            reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (window_id, payload.revision,
+         current_values["allowed_temp_min"], current_values["allowed_temp_max"],
+         current_values["max_continuous_exceed_seconds"],
+         current_values["max_sample_interval_seconds"],
+         new_values["allowed_temp_min"], new_values["allowed_temp_max"],
+         new_values["max_continuous_exceed_seconds"],
+         new_values["max_sample_interval_seconds"], payload.reason),
+    )
+    row = conn.execute(
+        "SELECT * FROM rule_revisions WHERE window_id=? AND rule_revision=?",
+        (window_id, payload.revision),
+    ).fetchone()
+    return "revised", rule_revision_to_dict(row)
+
+
+def list_rule_revisions(conn: sqlite3.Connection, window_id: int) -> list[dict[str, Any]]:
+    """窗口全部规则修订历史（第 1 版为初始规则），按修订号升序。"""
+    rows = conn.execute(
+        "SELECT * FROM rule_revisions WHERE window_id=? ORDER BY rule_revision ASC",
+        (window_id,),
+    ).fetchall()
+    if not rows:
+        # 旧库防御：无版本记录时按当前 windows 行合成第 1 版
+        win_row = get_window_row(conn, window_id)
+        return [{
+            "rule_revision": 1,
+            "before": None,
+            "after": _rule_values_from_window(win_row),
+            "reason": INITIAL_RULE_REASON,
+            "revised_at": win_row["created_at"],
+        }]
+    return [rule_revision_to_dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------- 签发
@@ -700,6 +947,7 @@ def issue_certificate(
             "allowed_temp_max": win["allowed_temp_max"],
             "max_continuous_exceed_seconds": win["max_continuous_exceed_seconds"],
             "max_sample_interval_seconds": win["max_sample_interval_seconds"],
+            "rule_revision": _current_rule_revision_number(conn, window_id),
         },
         "evaluation": evaluation,
         "readings": [reading_to_dict(r) for r in reading_rows],

@@ -23,6 +23,9 @@ from .schemas import (
     ReadingVoidResponse,
     ReadingVoidSubmit,
     RevisionReportOut,
+    RuleRevisionOut,
+    RuleRevisionResponse,
+    RuleRevisionSubmit,
     WindowCreate,
     WindowOut,
 )
@@ -41,13 +44,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
         "支持读数修订、幂等提交（单条与批量补传）、误采作废与恢复、"
+        "窗口规则版本化修订（初始规则为第 1 版，连续修订号 + 非空原因）、"
         "证书版本化签发，"
-        "并可对同一窗口两张已签发证书的不可变快照生成修订影响报告。"
+        "并可对同一窗口两张已签发证书的不可变快照生成修订影响报告"
+        "（跨规则版本时分别依两证快照重建时间线并给出四项规则前后值）。"
     ),
     lifespan=lifespan,
 )
@@ -103,6 +108,52 @@ def get_evaluation(
 ) -> dict[str, Any]:
     row = services.get_window_row(conn, window_id)
     return services.compute_evaluation(conn, row)
+
+
+# ------------------------------------------------------------ 窗口规则修订
+
+@app.post(
+    "/api/v1/windows/{window_id}/rule-revisions",
+    response_model=RuleRevisionResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["windows"],
+)
+def revise_window_rules(
+    window_id: int,
+    payload: RuleRevisionSubmit,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """馆员修订审定窗口规则（温度上下限、最长连续超限时长、最大采样间隔）。
+
+    提交窗口标识、目标规则修订号、四项完整新值与非空原因：
+    - 窗口初始规则为第 1 版；目标号为当前版 + 1 才生效（effect=revised），
+      窗口起止时间与读数保持不变，成功后留存前后规则/原因/时间，并按当前
+      活动读数在同一事务内立即重算；后续签发采用新规则，既有证书快照不变；
+    - 目标号等于当前版且四项值与原因均一致 -> 幂等重放（effect=idempotent，
+      不留新记录）；同号任一不一致 -> 409；
+    - 旧号（小于当前版）或跳号（大于当前版 + 1）-> 409，不留新记录；
+    - 数值非有限、温度下限大于上限、时长非正、原因空白 -> 422；
+    - 窗口不存在 -> 404。
+    """
+    with write_transaction(conn):
+        effect, revision = services.revise_window_rules(conn, window_id, payload)
+        win = services.get_window_row(conn, window_id)
+        evaluation = services.compute_evaluation(conn, win)
+        return {"effect": effect, "rule_revision": revision,
+                "current_evaluation": evaluation}
+
+
+@app.get(
+    "/api/v1/windows/{window_id}/rule-revisions",
+    response_model=list[RuleRevisionOut],
+    tags=["windows"],
+)
+def list_window_rule_revisions(
+    window_id: int, conn: sqlite3.Connection = Depends(get_conn)
+) -> list[dict[str, Any]]:
+    """窗口全部规则修订历史（第 1 版为初始规则），按修订号升序。"""
+    services.get_window_row(conn, window_id)
+    return services.list_rule_revisions(conn, window_id)
 
 
 # ---------------------------------------------------------------- 读数

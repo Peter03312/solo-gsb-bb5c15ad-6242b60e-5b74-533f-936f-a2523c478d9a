@@ -120,6 +120,79 @@ class IssueRequest(BaseModel):
     note: Optional[str] = Field(None, max_length=500, description="签发备注")
 
 
+# ------------------------------------------------------------ 规则修订
+
+class RuleValuesOut(BaseModel):
+    """规则四项值（与创建窗口请求体同义）。"""
+
+    allowed_temp_min: float
+    allowed_temp_max: float
+    max_continuous_exceed_seconds: float
+    max_sample_interval_seconds: float
+
+
+class RuleRevisionSubmit(BaseModel):
+    """馆员修订审定窗口规则：窗口号 + 目标规则修订号 + 四项完整新值 + 非空原因。
+
+    窗口初始规则视为第 1 版：
+    - revision 等于“当前版 + 1”才生效；修订成功后窗口规则立即更新并按当前
+      活动读数重算，后续签发采用新规则，既有证书快照不变；
+    - revision 等于当前版且四项规则值与原因均与已存修订一致 -> 幂等重放
+      （不产生新记录）；同号但任一值或原因不一致 -> 409；
+    - revision 小于当前版（旧号）或大于“当前版 + 1”（跳号）-> 409；
+    - 四项数值必须有限、温度下限不大于上限、两个时长为正（gt=0）。
+    """
+
+    revision: int = Field(..., ge=1, description="目标规则修订号（须等于当前版 + 1；重放则等于当前版）")
+    allowed_temp_min: float = Field(..., description="新的允许温度下限（含），°C")
+    allowed_temp_max: float = Field(..., description="新的允许温度上限（含），°C")
+    max_continuous_exceed_seconds: float = Field(..., gt=0, description="新的最长连续超限时长，秒（正）")
+    max_sample_interval_seconds: float = Field(..., gt=0, description="新的最大采样间隔，秒（正）")
+    reason: str = Field(..., min_length=1, max_length=500,
+                        description="修订原因（非空，不能只含空白字符）")
+
+    @field_validator("allowed_temp_min", "allowed_temp_max")
+    @classmethod
+    def _temp_finite(cls, v: float) -> float:
+        if math.isnan(v) or math.isinf(v):
+            raise ValueError("温度必须为有限数值")
+        return v
+
+    @field_validator("max_continuous_exceed_seconds", "max_sample_interval_seconds")
+    @classmethod
+    def _duration_finite_positive(cls, v: float) -> float:
+        if math.isnan(v) or math.isinf(v):
+            raise ValueError("时长必须为有限数值")
+        if v <= 0:
+            raise ValueError("时长必须为正数")
+        return v
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("修订原因不能为空（不能只含空白字符）")
+        return v
+
+
+class RuleRevisionOut(BaseModel):
+    """一条规则修订记录（第 1 版为窗口初始规则，before 四项为 null）。"""
+
+    rule_revision: int
+    before: Optional[RuleValuesOut] = Field(
+        None, description="修订前四项规则值；第 1 版（初始规则）为 null")
+    after: RuleValuesOut = Field(..., description="修订后（该版生效）四项规则值")
+    reason: str
+    revised_at: str = Field(..., description="修订操作时间（UTC）；第 1 版为窗口创建时间")
+
+
+class RuleRevisionResponse(BaseModel):
+    effect: str = Field(..., description="revised | idempotent")
+    rule_revision: RuleRevisionOut
+    current_evaluation: EvaluationOut = Field(
+        ..., description="按新规则与当前活动读数立即重算的审定结果")
+
+
 class SegmentOut(BaseModel):
     start: str
     end: str
@@ -157,6 +230,7 @@ class WindowOut(BaseModel):
     allowed_temp_max: float
     max_continuous_exceed_seconds: float
     max_sample_interval_seconds: float
+    rule_revision: int = Field(1, description="当前规则修订号（初始规则为第 1 版）")
     created_at: str
     current_evaluation: Optional[EvaluationOut] = None
     active_readings: list[ReadingOut] = []
@@ -284,6 +358,29 @@ class ReportTimeline(BaseModel):
     change_count: int
 
 
+class ReportRulesChange(BaseModel):
+    field: str
+    label_zh: str
+    before: float
+    after: float
+    delta: float
+    unit_zh: str
+
+
+class ReportRulesDiff(BaseModel):
+    """跨规则版本比对：两证快照各自规则修订号与四项规则的前后值。"""
+
+    rule_revision_before: int
+    rule_revision_after: int
+    rules_changed: bool
+    changed_fields: list[str] = Field(
+        ..., description="allowed_temp_min | allowed_temp_max | "
+                        "max_continuous_exceed_seconds | max_sample_interval_seconds 的子集")
+    before: dict[str, Any] = Field(..., description="旧证快照的四项规则值与规则修订号")
+    after: dict[str, Any] = Field(..., description="新证快照的四项规则值与规则修订号")
+    changes: list[ReportRulesChange]
+
+
 class ReportCertificateRef(BaseModel):
     id: int
     window_id: int
@@ -313,6 +410,7 @@ class RevisionReportOut(BaseModel):
     window: dict[str, Any]
     old_certificate: ReportCertificateRef
     new_certificate: ReportCertificateRef
+    rules_diff: ReportRulesDiff
     readings_diff: ReportReadingsDiff
     timeline: ReportTimeline
     summary: ReportSummary
