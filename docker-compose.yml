@@ -1,0 +1,25 @@
+services:
+  audit-service:
+    build: .
+    image: museum-case-audit:latest
+    container_name: museum-case-audit
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite 数据库文件路径（容器内）；通过卷持久化到宿主机
+      - AUDIT_DB_PATH=/data/audit.db
+      # 写锁等待毫秒数（签发与修订并发时用）
+      - AUDIT_DB_TIMEOUT=10
+      - LOG_LEVEL=info
+    volumes:
+      - audit-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  audit-data:
