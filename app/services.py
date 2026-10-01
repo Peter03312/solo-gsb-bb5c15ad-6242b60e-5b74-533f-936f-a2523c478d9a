@@ -10,8 +10,23 @@ from fastapi import HTTPException, status
 from .evaluation import evaluate
 from .models import READING_VOIDED, VERDICT_LABELS_ZH
 from .report import build_revision_report
-from .schemas import ReadingBatchSubmit, ReadingSubmit, ReadingVoidSubmit, WindowCreate
+from .database import INITIAL_RULE_REASON
+from .schemas import (
+    ReadingBatchSubmit,
+    ReadingSubmit,
+    ReadingVoidSubmit,
+    WindowCreate,
+    WindowRuleRevisionSubmit,
+)
 from .timeutils import parse_stored, to_iso, to_utc
+
+# 四项规则值字段（windows / rule_revisions / 快照 window 内同名）
+RULE_VALUE_FIELDS = (
+    "allowed_temp_min",
+    "allowed_temp_max",
+    "max_continuous_exceed_seconds",
+    "max_sample_interval_seconds",
+)
 
 
 # ---------------------------------------------------------------- 窗口
@@ -47,7 +62,10 @@ def create_window(conn: sqlite3.Connection, payload: WindowCreate) -> dict[str, 
             payload.max_sample_interval_seconds,
         ),
     )
-    row = conn.execute("SELECT * FROM windows WHERE id = ?", (cur.lastrowid,)).fetchone()
+    window_id = int(cur.lastrowid)
+    # 初始规则视为第 1 版：与窗口同一事务播种，原因是系统播种说明。
+    seed_rule_revision(conn, window_id, payload, INITIAL_RULE_REASON)
+    row = conn.execute("SELECT * FROM windows WHERE id = ?", (window_id,)).fetchone()
     return window_to_dict(conn, row)
 
 
@@ -63,6 +81,166 @@ def list_windows(conn: sqlite3.Connection, limit: int = 100, offset: int = 0) ->
         "SELECT * FROM windows ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
     ).fetchall()
     return [window_to_dict(conn, r) for r in rows]
+
+
+# ---------------------------------------------------------------- 窗口规则修订
+
+def seed_rule_revision(
+    conn: sqlite3.Connection, window_id: int,
+    payload: WindowCreate | WindowRuleRevisionSubmit, reason: str,
+    revision: int = 1,
+) -> None:
+    """写入一条规则版本（默认第 1 版）。仅供创建窗口播种/回填使用。"""
+    conn.execute(
+        """
+        INSERT INTO rule_revisions (window_id, revision, allowed_temp_min,
+                                    allowed_temp_max, max_continuous_exceed_seconds,
+                                    max_sample_interval_seconds, reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            window_id, revision,
+            payload.allowed_temp_min,
+            payload.allowed_temp_max,
+            payload.max_continuous_exceed_seconds,
+            payload.max_sample_interval_seconds,
+            reason,
+        ),
+    )
+
+
+def get_current_rule_revision(conn: sqlite3.Connection, window_id: int) -> sqlite3.Row:
+    """取窗口当前（版本号最大）规则行；缺失则防御性 500（正常流程总有第 1 版）。"""
+    row = conn.execute(
+        "SELECT * FROM rule_revisions WHERE window_id=? ORDER BY revision DESC LIMIT 1",
+        (window_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"窗口 {window_id} 缺少初始规则版本（第 1 版），数据不完整",
+        )
+    return row
+
+
+def rule_values_from(row: sqlite3.Row | dict[str, Any]) -> dict[str, float]:
+    """从 windows/rule_revisions 行或快照 window dict 提取四项规则值。"""
+    return {field: float(row[field]) for field in RULE_VALUE_FIELDS}
+
+
+def rule_revision_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    data = rule_values_from(row)
+    data.update({"revision": int(row["revision"]),
+                 "reason": row["reason"], "created_at": row["created_at"]})
+    return data
+
+
+def list_rule_revisions(conn: sqlite3.Connection, window_id: int) -> list[dict[str, Any]]:
+    """窗口全部规则版本（第 1 版起，按版本号升序）。窗口不存在 -> 404。"""
+    get_window_row(conn, window_id)
+    rows = conn.execute(
+        "SELECT * FROM rule_revisions WHERE window_id=? ORDER BY revision ASC",
+        (window_id,),
+    ).fetchall()
+    return [rule_revision_to_dict(r) for r in rows]
+
+
+def revise_window_rules(
+    conn: sqlite3.Connection, window_id: int, payload: WindowRuleRevisionSubmit
+) -> tuple[str, dict[str, Any], dict[str, Any], sqlite3.Row]:
+    """按版本号语义修订窗口四项规则。调用方需已持有写事务。
+
+    返回 (effect, before_values, after_rule_dict, fresh_window_row)：
+    - effect == "revised"：目标号恰为当前版 + 1，更新 windows 当前值并追加新版本；
+    - effect == "idempotent"：目标号等于当前版，且四项值与原因均与当前版一致，
+      原样重放、不新增记录；
+    - 同号但值或原因不一致（同号冲突）、旧号、跳号（高于当前版 + 1）-> 409，
+      且不留任何新记录。
+
+    窗口起止时间与读数均不改变；审定重算由调用方在同一事务内用返回的
+    fresh_window_row 完成。
+    """
+    current = get_current_rule_revision(conn, window_id)
+    cur_rev = int(current["revision"])
+    new_values = {
+        "allowed_temp_min": float(payload.allowed_temp_min),
+        "allowed_temp_max": float(payload.allowed_temp_max),
+        "max_continuous_exceed_seconds": float(payload.max_continuous_exceed_seconds),
+        "max_sample_interval_seconds": float(payload.max_sample_interval_seconds),
+    }
+
+    if payload.target_revision < cur_rev:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"窗口 {window_id} 当前规则版本为 {cur_rev}，"
+                f"拒绝目标修订号 {payload.target_revision}：旧规则版本不能覆盖更新版本。"
+            ),
+        )
+    if payload.target_revision > cur_rev + 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"窗口 {window_id} 当前规则版本为 {cur_rev}，"
+                f"拒绝目标修订号 {payload.target_revision}：规则修订号必须连续，"
+                f"下一生效版本为 {cur_rev + 1}（不允许跳号）。"
+            ),
+        )
+
+    before_values = rule_values_from(current)
+    if payload.target_revision == cur_rev:
+        # 同号重放：四项值与原因全部一致才幂等，任一不同即同号冲突。
+        same_values = all(new_values[f] == before_values[f] for f in RULE_VALUE_FIELDS)
+        if not same_values or payload.reason != current["reason"]:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"窗口 {window_id} 规则版本 {cur_rev} 已存在：相同修订号重放必须"
+                    "四项规则值与原因完全一致；如需修改请使用目标修订号 "
+                    f"{cur_rev + 1}。"
+                ),
+            )
+        win = conn.execute("SELECT * FROM windows WHERE id = ?", (window_id,)).fetchone()
+        return "idempotent", before_values, rule_revision_to_dict(current), win
+
+    # target == cur_rev + 1：生效。更新 windows 当前四项值，追加新版本行。
+    conn.execute(
+        """
+        UPDATE windows
+           SET allowed_temp_min=?, allowed_temp_max=?,
+               max_continuous_exceed_seconds=?, max_sample_interval_seconds=?
+         WHERE id=?
+        """,
+        (
+            new_values["allowed_temp_min"],
+            new_values["allowed_temp_max"],
+            new_values["max_continuous_exceed_seconds"],
+            new_values["max_sample_interval_seconds"],
+            window_id,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO rule_revisions (window_id, revision, allowed_temp_min,
+                                    allowed_temp_max, max_continuous_exceed_seconds,
+                                    max_sample_interval_seconds, reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            window_id, cur_rev + 1,
+            new_values["allowed_temp_min"],
+            new_values["allowed_temp_max"],
+            new_values["max_continuous_exceed_seconds"],
+            new_values["max_sample_interval_seconds"],
+            payload.reason,
+        ),
+    )
+    after_row = conn.execute(
+        "SELECT * FROM rule_revisions WHERE window_id=? AND revision=?",
+        (window_id, cur_rev + 1),
+    ).fetchone()
+    win = conn.execute("SELECT * FROM windows WHERE id = ?", (window_id,)).fetchone()
+    return "revised", before_values, rule_revision_to_dict(after_row), win
 
 
 # ---------------------------------------------------------------- 读数
@@ -650,6 +828,10 @@ def window_to_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]
         "SELECT version, verdict FROM certificates WHERE window_id=? ORDER BY version DESC LIMIT 1",
         (row["id"],),
     ).fetchone()
+    rule_rev = conn.execute(
+        "SELECT MAX(revision) AS r FROM rule_revisions WHERE window_id=?",
+        (row["id"],),
+    ).fetchone()
     return {
         "id": row["id"],
         "name": row["name"],
@@ -660,6 +842,7 @@ def window_to_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]
         "max_continuous_exceed_seconds": row["max_continuous_exceed_seconds"],
         "max_sample_interval_seconds": row["max_sample_interval_seconds"],
         "created_at": row["created_at"],
+        "rule_revision": rule_rev["r"] if rule_rev is not None else None,
         "latest_certificate_version": latest["version"] if latest else None,
         "latest_verdict": latest["verdict"] if latest else None,
     }
@@ -690,6 +873,7 @@ def issue_certificate(
     ).fetchone()
     version = (last["v"] or 0) + 1
 
+    rule_row = get_current_rule_revision(conn, window_id)
     snapshot = {
         "window": {
             "id": win["id"],
@@ -700,6 +884,8 @@ def issue_certificate(
             "allowed_temp_max": win["allowed_temp_max"],
             "max_continuous_exceed_seconds": win["max_continuous_exceed_seconds"],
             "max_sample_interval_seconds": win["max_sample_interval_seconds"],
+            # 签发时固化的规则版本号；旧快照缺该键时按第 1 版处理。
+            "rule_revision": int(rule_row["revision"]),
         },
         "evaluation": evaluation,
         "readings": [reading_to_dict(r) for r in reading_rows],

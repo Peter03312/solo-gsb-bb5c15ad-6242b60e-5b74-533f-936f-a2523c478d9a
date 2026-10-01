@@ -81,6 +81,25 @@ CREATE TABLE IF NOT EXISTS certificates (
 
 CREATE INDEX IF NOT EXISTS idx_certificates_window
     ON certificates(window_id, version);
+
+-- 窗口审定规则版本：窗口创建即播种第 1 版（初始规则），馆员修订严格按
+-- “当前版 + 1”追加；windows 表的四项参数始终等于最新版规则值。
+-- 每次修订留存四项规则前后值（前值可由上一行得到）、原因与操作时间。
+CREATE TABLE IF NOT EXISTS rule_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER NOT NULL REFERENCES windows(id),
+    revision INTEGER NOT NULL,                 -- 初始规则为 1，逐次 +1
+    allowed_temp_min REAL NOT NULL,
+    allowed_temp_max REAL NOT NULL,
+    max_continuous_exceed_seconds REAL NOT NULL,
+    max_sample_interval_seconds REAL NOT NULL,
+    reason TEXT NOT NULL,                      -- 修订原因（非空；第 1 版为系统播种说明）
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(window_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rule_revisions_window
+    ON rule_revisions(window_id, revision);
 """
 
 # 旧库迁移：CREATE TABLE IF NOT EXISTS 不会给已存在的表补列，
@@ -109,13 +128,37 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
     return conn
 
 
+# 初始规则版本的系统播种原因（窗口创建即第 1 版）
+INITIAL_RULE_REASON = "窗口创建时的初始审定规则（第 1 版）"
+
+
 def init_db(conn: sqlite3.Connection) -> None:
-    """幂等建表；对已存在的旧库补齐作废相关列。"""
+    """幂等建表；对已存在的旧库补齐作废相关列。
+
+    同时为本功能上线前已存在、尚无规则版本的窗口补播第 1 版规则
+    （取 windows 表当前四项参数），保证“窗口初始规则视为第 1 版”不变式
+    对旧库同样成立。
+    """
     conn.executescript(SCHEMA_SQL)
     for table, column, ddl in _COLUMN_MIGRATIONS:
         cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         if column not in cols:
             conn.execute(ddl)
+    conn.execute(
+        """
+        INSERT INTO rule_revisions (window_id, revision, allowed_temp_min,
+                                    allowed_temp_max, max_continuous_exceed_seconds,
+                                    max_sample_interval_seconds, reason)
+        SELECT w.id, 1, w.allowed_temp_min, w.allowed_temp_max,
+               w.max_continuous_exceed_seconds, w.max_sample_interval_seconds, ?
+        FROM windows AS w
+        WHERE NOT EXISTS (
+            SELECT 1 FROM rule_revisions AS r
+            WHERE r.window_id = w.id AND r.revision = 1
+        )
+        """,
+        (INITIAL_RULE_REASON,),
+    )
     conn.commit()
 
 

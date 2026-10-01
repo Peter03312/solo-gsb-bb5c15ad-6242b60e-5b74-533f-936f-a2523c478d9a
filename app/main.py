@@ -1,11 +1,15 @@
 """FastAPI 入口：博物馆展柜温度暴露审定服务。"""
 from __future__ import annotations
 
+import math
 import sqlite3
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, Query, status
+from fastapi import Depends, FastAPI, Query, Request, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from . import services
 from .database import connect, get_conn, init_db, write_transaction
@@ -23,9 +27,28 @@ from .schemas import (
     ReadingVoidResponse,
     ReadingVoidSubmit,
     RevisionReportOut,
+    RuleRevisionOut,
     WindowCreate,
     WindowOut,
+    WindowRuleRevisionResponse,
+    WindowRuleRevisionSubmit,
 )
+
+
+def _sanitize_json(obj: Any) -> Any:
+    """递归把 NaN/±Infinity 替换为字符串，使 422 错误体可被严格 JSON 序列化。
+
+    非法数值（NaN/Infinity）在 Pydantic 层已判为校验失败，但默认错误处理器会
+    回显原始 input，其中非有限浮点无法用严格 JSON 输出（会引发 500）。这里仅
+    对错误回显做无害化，响应仍是标准 {"detail": [...]} 的 422。
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else str(obj)
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_json(v) for v in obj]
+    return obj
 
 
 @asynccontextmanager
@@ -41,16 +64,29 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="博物馆展柜温度暴露审定服务",
-    version="1.3.0",
+    version="1.4.0",
     description=(
         "对展柜在给定审定窗口内的温度读数进行暴露审定："
         "输出正常/超限/未知区段与最长连续超限时长，"
         "支持读数修订、幂等提交（单条与批量补传）、误采作废与恢复、"
+        "窗口审定规则版本化修订（初始规则为第 1 版，按当前活动读数立即重算）、"
         "证书版本化签发，"
-        "并可对同一窗口两张已签发证书的不可变快照生成修订影响报告。"
+        "并可对同一窗口两张已签发证书的不可变快照生成修订影响报告"
+        "（含跨规则版本的四项规则前后值与变化）。"
     ),
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_exception_handler(request: Request, exc: RequestValidationError):
+    # 保持 FastAPI 默认 422 结构（{"detail": [...]}），仅对回显中的 NaN/Infinity
+    # 做无害化，避免严格 JSON 序列化失败把“非法输入”变成 500。
+    detail = _sanitize_json(jsonable_encoder(exc.errors()))
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": detail},
+    )
 
 
 @app.get("/health", tags=["meta"])
@@ -103,6 +139,60 @@ def get_evaluation(
 ) -> dict[str, Any]:
     row = services.get_window_row(conn, window_id)
     return services.compute_evaluation(conn, row)
+
+
+# ---------------------------------------------------------------- 窗口规则修订
+
+@app.post(
+    "/api/v1/windows/{window_id}/rule-revisions",
+    response_model=WindowRuleRevisionResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["windows"],
+)
+def revise_window_rules(
+    window_id: int,
+    payload: WindowRuleRevisionSubmit,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """馆员修订审定窗口的四项规则（温度上下限、最长连续超限时长、最大采样间隔）。
+
+    - 提交窗口标识（路径）、目标规则修订号、四项完整新值与非空原因；
+    - 窗口初始规则视为第 1 版：目标号为当前版 + 1 才生效，
+      等于当前版且四项值与原因均一致为重放幂等（不留新记录），
+      其余同号冲突、旧号、跳号提交一律 409 拒绝且不留新记录；
+    - 四项数值须有限、温度下限不大于上限、两个时长为正（422），
+      原因为非空（422）；窗口不存在 -> 404；
+    - 窗口起止时间与读数保持不变；成功后按当前活动读数在同一事务内立即重算，
+      并留存前后规则、原因与时间；后续签发采用新规则，既有证书快照不变。
+    """
+    # 单个写事务：版本号校验 + 规则更新/版本留存 + 基于当前读数立即重算
+    with write_transaction(conn):
+        services.get_window_row(conn, window_id)  # 窗口不存在 -> 404
+        effect, before, after, win = services.revise_window_rules(conn, window_id, payload)
+        evaluation = services.compute_evaluation(conn, win)
+        return {
+            "effect": effect,
+            "window_id": window_id,
+            "current_rule_revision": after["revision"],
+            "before": before,
+            "after": after,
+            "current_evaluation": evaluation,
+        }
+
+
+@app.get(
+    "/api/v1/windows/{window_id}/rule-revisions",
+    response_model=list[RuleRevisionOut],
+    tags=["windows"],
+)
+def list_window_rule_revisions(
+    window_id: int, conn: sqlite3.Connection = Depends(get_conn)
+) -> list[dict[str, Any]]:
+    """窗口全部规则版本历史（第 1 版初始规则起，按版本号升序）。
+
+    每版留存四项规则值、原因与操作时间；窗口不存在 -> 404。
+    """
+    return services.list_rule_revisions(conn, window_id)
 
 
 # ---------------------------------------------------------------- 读数

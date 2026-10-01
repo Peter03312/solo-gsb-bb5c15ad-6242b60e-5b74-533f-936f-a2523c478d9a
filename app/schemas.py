@@ -5,7 +5,7 @@ import math
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def _require_aware(dt: datetime) -> datetime:
@@ -120,6 +120,63 @@ class IssueRequest(BaseModel):
     note: Optional[str] = Field(None, max_length=500, description="签发备注")
 
 
+def _finite_number(v: float) -> float:
+    """四项数值参数的通用有限性校验：拒绝 NaN / ±Infinity。"""
+    if math.isnan(v) or math.isinf(v):
+        raise ValueError("数值必须为有限数（不接受 NaN 或 Infinity）")
+    return v
+
+
+class WindowRuleRevisionSubmit(BaseModel):
+    """馆员修订一个审定窗口的四项规则。
+
+    四项完整新值（温度上下限、最长连续超限时长、最大采样间隔）与非空原因
+    必须随请求一次性提交；窗口初始规则视为第 1 版：
+
+    - target_revision == 当前版 + 1：生效，追加新版本并按当前活动读数立即重算；
+    - target_revision == 当前版，且四项值与原因均与当前版一致：重放幂等，
+      不新增记录；
+    - target_revision == 当前版但值或原因不一致：409 同号冲突；
+    - 目标号低于当前版（旧号）或高于当前版 + 1（跳号）：409 拒绝；
+    - 四项数值须有限、温度下限不大于上限、两个时长为正：422；
+      原因非空（不能只含空白）。
+    窗口起止时间与读数不随规则修订改变。
+    """
+
+    target_revision: int = Field(..., ge=1, description="目标规则修订号；仅当等于当前版 + 1 时生效")
+    allowed_temp_min: float = Field(..., description="新允许温度下限（含），°C")
+    allowed_temp_max: float = Field(..., description="新允许温度上限（含），°C")
+    max_continuous_exceed_seconds: float = Field(..., description="新最长连续超限时长，秒（正）")
+    max_sample_interval_seconds: float = Field(..., description="新最大采样间隔，秒（正）")
+    reason: str = Field(..., min_length=1, max_length=500,
+                        description="修订原因（非空，不能只含空白字符）")
+
+    @field_validator(
+        "allowed_temp_min", "allowed_temp_max",
+        "max_continuous_exceed_seconds", "max_sample_interval_seconds",
+    )
+    @classmethod
+    def _all_finite(cls, v: float) -> float:
+        return _finite_number(v)
+
+    @field_validator("reason")
+    @classmethod
+    def _non_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("修订原因不能为空（不能只含空白字符）")
+        return v
+
+    @model_validator(mode="after")
+    def _check_rule_values(self) -> "WindowRuleRevisionSubmit":
+        if self.allowed_temp_max < self.allowed_temp_min:
+            raise ValueError("allowed_temp_max 不能小于 allowed_temp_min（温度下限不大于上限）")
+        if self.max_continuous_exceed_seconds <= 0:
+            raise ValueError("max_continuous_exceed_seconds 必须为正数")
+        if self.max_sample_interval_seconds <= 0:
+            raise ValueError("max_sample_interval_seconds 必须为正数")
+        return self
+
+
 class SegmentOut(BaseModel):
     start: str
     end: str
@@ -158,6 +215,9 @@ class WindowOut(BaseModel):
     max_continuous_exceed_seconds: float
     max_sample_interval_seconds: float
     created_at: str
+    rule_revision: Optional[int] = Field(
+        None, description="当前审定规则版本号（初始规则为第 1 版）"
+    )
     current_evaluation: Optional[EvaluationOut] = None
     active_readings: list[ReadingOut] = []
     latest_certificate_version: Optional[int] = None
@@ -224,6 +284,36 @@ class ReadingRevisionOut(BaseModel):
     void_reason: Optional[str] = Field(None, description="作废原因（仅 voided 行）")
     voided_at: Optional[str] = Field(None, description="作废操作时间（仅 voided 行）")
     prev_revision: Optional[int] = Field(None, description="被作废的前一版本修订号（仅 voided 行）")
+
+
+# ------------------------------------------------------------ 窗口规则修订
+
+class RuleValuesOut(BaseModel):
+    """一版审定规则的四项完整值（不含窗口起止时间）。"""
+
+    allowed_temp_min: float
+    allowed_temp_max: float
+    max_continuous_exceed_seconds: float
+    max_sample_interval_seconds: float
+
+
+class RuleRevisionOut(RuleValuesOut):
+    """规则修订历史行：四项值 + 版本号 + 原因 + 操作时间。"""
+
+    revision: int = Field(..., description="规则版本号（初始规则为第 1 版）")
+    reason: str = Field(..., description="本版修订原因（第 1 版为系统播种说明）")
+    created_at: str = Field(..., description="本版生效时间（UTC）")
+
+
+class WindowRuleRevisionResponse(BaseModel):
+    effect: str = Field(..., description="revised | idempotent")
+    window_id: int
+    current_rule_revision: int = Field(..., description="修订后（或幂等重放所对应）的当前规则版本号")
+    before: RuleValuesOut = Field(..., description="修订前一版规则的四项值")
+    after: RuleRevisionOut = Field(..., description="本次生效（或重放）版本的四项值、原因与时间")
+    current_evaluation: EvaluationOut = Field(
+        ..., description="按当前活动读数与新规则立即重算的审定结果"
+    )
 
 
 class CertificateOut(BaseModel):
@@ -294,6 +384,24 @@ class ReportCertificateRef(BaseModel):
     note: Optional[str]
 
 
+class ReportRuleSide(RuleValuesOut):
+    """报告中一版证书快照使用的规则版本与四项值。"""
+
+    rule_revision: int
+
+
+class ReportRulesDiff(BaseModel):
+    """跨规则版本的四项规则前后值与变化（即使结论未变也能看出规则变更）。"""
+
+    before: ReportRuleSide
+    after: ReportRuleSide
+    changed_fields: list[str] = Field(
+        ..., description="发生变化的四项规则字段子集（rule_revision 单独以 revision_changed 表示）"
+    )
+    revision_changed: bool = Field(..., description="两证快照的规则版本号是否不同")
+    changed: bool = Field(..., description="四项规则值是否至少一项发生变化")
+
+
 class ReportSummary(BaseModel):
     verdict_before: str
     verdict_after: str
@@ -313,6 +421,7 @@ class RevisionReportOut(BaseModel):
     window: dict[str, Any]
     old_certificate: ReportCertificateRef
     new_certificate: ReportCertificateRef
+    rules_diff: ReportRulesDiff
     readings_diff: ReportReadingsDiff
     timeline: ReportTimeline
     summary: ReportSummary
